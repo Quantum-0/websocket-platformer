@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Мультиплеерный Платформер с Боем</title>
+    <style>
+        body {
+            margin: 0;
+            background: #222;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            border: 4px solid #444;
+            background: #111;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas" width="800" height="500"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// Загрузка изображений (Замените URL-адреса на свои картинки при необходимости)
+const backgroundImage = new Image();
+backgroundImage.src = 'bg.png'; // Задний план
+
+const foregroundImage = new Image();
+foregroundImage.src = 'fg.png'; // Передний план (прозрачный)
+
+// Подключение к серверу
+//const socket = new WebSocket('ws://localhost:8001');
+const socket = new WebSocket((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws');
+
+let myId = null;
+const player = {
+    x: 100,
+    y: 300,
+    width: 30,
+    height: 30,
+    vx: 0,
+    vy: 0,
+    speed: 5,
+    gravity: 0.6,
+    jumpForce: 15, // 12
+    grounded: false,
+    color: '#ff0000',
+    hp: 100,
+    // Для оптимизации трафика: храним прошлые отправленные координаты
+    lastSentX: 0,
+    lastSentY: 0
+};
+
+// Хранилище сетевых игроков. Теперь хранит текущие экранные координаты (renderX, renderY) 
+// и целевые координаты от сервера (targetX, targetY) для интерполяции.
+let onlinePlayers = {};
+
+const platforms = [
+    { x: 0, y: 437, w: 800, h: 70 },
+    { x: 145, y: 268, w: 190, h: 20 },
+    { x: 442, y: 194, w: 200, h: 20 },
+    { x: 240, y: 120, w: 150, h: 20 }
+];
+
+const keys = { Left: false, Right: false, Up: false };
+
+// Управление клавиатурой и мышью
+window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyA' || e.code === 'ArrowLeft') keys.Left = true;
+    if (e.code === 'KeyD' || e.code === 'ArrowRight') keys.Right = true;
+    if (e.code === 'KeyW' || e.code === 'Space' || e.code === 'ArrowUp') keys.Up = true;
+    if (e.code === 'KeyF') sendAttack(); // Атака на кнопку F
+});
+
+window.addEventListener('keyup', (e) => {
+    if (e.code === 'KeyA' || e.code === 'ArrowLeft') keys.Left = false;
+    if (e.code === 'KeyD' || e.code === 'ArrowRight') keys.Right = false;
+    if (e.code === 'KeyW' || e.code === 'Space' || e.code === 'ArrowUp') keys.Up = false;
+});
+
+window.addEventListener('mousedown', () => {
+    sendAttack(); // Атака на левый клик мыши
+});
+
+function sendAttack() {
+    if (socket.readyState === WebSocket.OPEN && myId !== null) {
+        socket.send(JSON.stringify({ type: 'attack' }));
+    }
+}
+
+// Обработка сети
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    
+    if (data.type === 'init') {
+        myId = data.id;
+    } else if (data.type === 'game_over') {
+        alert('Вы погибли! Перезагрузите страницу, чтобы возродиться.');
+        location.reload();
+    } else if (data.type === 'remove') {
+        delete onlinePlayers[data.id];
+    } else if (data.type === 'state') {
+        // Синхронизируем список игроков с сервером
+        data.players.forEach(serverPlayer => {
+            if (serverPlayer.id === myId) {
+                player.hp = serverPlayer.hp;
+                player.color = serverPlayer.color;
+                return;
+            }
+
+            // Если игрок новый, добавляем его в локальную базу
+            if (!onlinePlayers[serverPlayer.id]) {
+                onlinePlayers[serverPlayer.id] = {
+                    id: serverPlayer.id,
+                    renderX: serverPlayer.x, // Сюда плавно движемся
+                    renderY: serverPlayer.y,
+                    targetX: serverPlayer.x,  // Сюда прислал сервер
+                    targetY: serverPlayer.y,
+                    color: serverPlayer.color,
+                    hp: serverPlayer.hp,
+                    lastAttack: serverPlayer.lastAttack
+                };
+            } else {
+                // Если игрок уже есть, обновляем его цели и параметры
+                const p = onlinePlayers[serverPlayer.id];
+                p.targetX = serverPlayer.x;
+                p.targetY = serverPlayer.y;
+                p.hp = serverPlayer.hp;
+                p.color = serverPlayer.color;
+                p.lastAttack = serverPlayer.lastAttack;
+            }
+        });
+    }
+};
+
+function checkPlatformCollisions() {
+    player.grounded = false;
+    for (let plat of platforms) {
+        if (player.x < plat.x + plat.w &&
+            player.x + player.width > plat.x &&
+            player.y < plat.y + plat.h &&
+            player.y + player.height > plat.y) {
+            if (player.vy > 0 && (player.y + player.height - player.vy) <= plat.y) {
+                player.y = plat.y - player.height;
+                player.vy = 0;
+                player.grounded = true;
+            }
+        }
+    }
+}
+
+// Линейная интерполяция (lerp) для сглаживания
+function lerp(start, end, amt) {
+    return (1 - amt) * start + amt * end;
+}
+
+function update() {
+    // Физика
+    if (keys.Left) player.vx = -player.speed;
+    else if (keys.Right) player.vx = player.speed;
+    else player.vx = 0;
+
+    if (keys.Up && player.grounded) {
+        player.vy = -player.jumpForce;
+        player.grounded = false;
+    }
+
+    player.vy += player.gravity;
+    player.x += player.vx;
+    player.y += player.vy;
+
+    if (player.x < 0) player.x = 0;
+    if (player.x + player.width > canvas.width) player.x = canvas.width - player.width;
+
+    checkPlatformCollisions();
+
+    // ОПТИМИЗАЦИЯ ТРАФИКА: Отправляем координаты ТОЛЬКО если они изменились
+    if (player.x !== player.lastSentX || player.y !== player.lastSentY) {
+        if (socket.readyState === WebSocket.OPEN && myId !== null) {
+            socket.send(JSON.stringify({
+                type: 'move',
+                x: player.x,
+                y: player.y
+            }));
+            player.lastSentX = player.x;
+            player.lastSentY = player.y;
+        }
+    }
+
+    // ИНТЕРПОЛЯЦИЯ: Плавно двигаем чужих игроков к их целевым координатам
+    for (let id in onlinePlayers) {
+        const p = onlinePlayers[id];
+        // 0.2 — скорость доводки (чем меньше, тем плавнее, но может быть задержка)
+        p.renderX = lerp(p.renderX, p.targetX, 0.2);
+        p.renderY = lerp(p.renderY, p.targetY, 0.2);
+    }
+}
+
+// Функция отрисовки полоски здоровья
+function drawHealthBar(x, y, hp) {
+    const width = 40;
+    const height = 6;
+    const barX = x - (width - player.width) / 2;
+    const barY = y - 12;
+
+    // Рассчитываем цвет от зеленого к красному
+    const red = Math.floor((100 - hp) * 2.55);
+    const green = Math.floor(hp * 2.55);
+    
+    ctx.fillStyle = '#333';
+    ctx.fillRect(barX, barY, width, height); // Фон полоски
+
+    ctx.fillStyle = `rgb(${red}, ${green}, 0)`;
+    ctx.fillRect(barX, barY, width * (hp / 100), height); // Текущее HP
+}
+
+// Рисование эффекта атаки
+function drawAttackEffect(x, y, lastAttackTime) {
+    // Рисуем вспышку, если с момента удара прошло меньше 0.15 сек
+    if (Date.now() / 1000 - lastAttackTime < 0.15) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+        // Область удара слева
+        ctx.fillRect(x - player.width, y, player.width, player.height);
+        // Область удара справа
+        ctx.fillRect(x + player.width, y, player.width, player.height);
+    }
+}
+
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 1. СЛОЙ: BACKGROUND (Отрисовка фонового изображения)
+    if (backgroundImage.complete) {
+        ctx.drawImage(backgroundImage, 0, 0, canvas.width, canvas.height);
+    }
+
+    // 2. СЛОЙ: Игровые объекты (Платформы)
+    ctx.fillStyle = '#555';
+    for (let plat of platforms) {
+        // ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+    }
+
+    // 3. СЛОЙ: Другие игроки (сглаженные координаты через интерполяцию)
+    for (let id in onlinePlayers) {
+        const p = onlinePlayers[id];
+        
+        // Рисуем кубик
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = 0.6;
+        ctx.fillRect(p.renderX, p.renderY, player.width, player.height);
+        ctx.globalAlpha = 1.0;
+
+        // Эффекты и интерфейс
+        drawHealthBar(p.renderX, p.renderY, p.hp);
+        drawAttackEffect(p.renderX, p.renderY, p.lastAttack);
+    }
+
+    // 4. СЛОЙ: Наш локальный игрок
+    ctx.fillStyle = player.color;
+    ctx.fillRect(player.x, player.y, player.width, player.height);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(player.x, player.y, player.width, player.height);
+    
+    // Получаем таймстамп последней атаки (если она была сохранена на сервере)
+    const myServerData = Object.values(onlinePlayers).find(p => p.id === myId);
+    const myLastAttack = myServerData ? myServerData.lastAttack : 0;
+
+    drawHealthBar(player.x, player.y, player.hp);
+    drawAttackEffect(player.x, player.y, myLastAttack);
+
+    // 5. СЛОЙ: FOREGROUND (Отрисовка переднего плана поверх всего)
+    if (foregroundImage.complete) {
+        ctx.drawImage(foregroundImage, 0, 10, canvas.width, canvas.height*1.15);
+    }
+}
+
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
